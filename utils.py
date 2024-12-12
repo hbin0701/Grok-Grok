@@ -116,28 +116,90 @@ def analyze_neuron_frequencies(model, p=113, device='cuda'):
     # 5. Additional metrics for early training
     num_specialized_neurons = np.sum(neuron_frac_explained > 0.5)  # Count neurons with clear frequency preference
     max_freq_strength = np.max(neuron_frac_explained)  # Strongest frequency preference found
+
+    # 6. TODO: I want to see whether some of the key frequencies vanish and reappear in a different neuron. Introduce this metric for me
+    def calculate_frequency_transitions(current_freqs, current_strengths, prev_freqs=None, prev_strengths=None):
+        if prev_freqs is None or prev_strengths is None:
+            return {
+                'freq_transitions': 0,
+                'strength_preservation': 0.0,
+                'active_freqs': set(current_freqs)
+            }
+        
+        # Track frequencies that disappeared and reappeared
+        prev_freq_to_neurons = {f: set(np.where(prev_freqs == f)[0]) 
+                              for f in np.unique(prev_freqs)}
+        curr_freq_to_neurons = {f: set(np.where(current_freqs == f)[0]) 
+                              for f in np.unique(current_freqs)}
+        
+        # Calculate transitions
+        transitions = 0
+        strength_preservation = 0.0
+        
+        for freq in set(prev_freq_to_neurons.keys()) & set(curr_freq_to_neurons.keys()):
+            prev_neurons = prev_freq_to_neurons[freq]
+            curr_neurons = curr_freq_to_neurons[freq]
+            
+            if prev_neurons != curr_neurons:
+                transitions += 1
+                
+                # Calculate strength preservation for this frequency
+                prev_strength = max(prev_strengths[list(prev_neurons)])
+                curr_strength = max(current_strengths[list(curr_neurons)])
+                strength_preservation += min(prev_strength, curr_strength) / max(prev_strength, curr_strength)
+        
+        if transitions > 0:
+            strength_preservation /= transitions
+            
+        return {
+            'freq_transitions': transitions,
+            'strength_preservation': float(strength_preservation),
+            'active_freqs': set(current_freqs)
+        }
+    
+    # Store the transition metrics in the results
+    transition_metrics = calculate_frequency_transitions(
+        neuron_freqs, 
+        neuron_frac_explained
+    )
+
     
     # Clear the cache to free memory
     model.remove_all_hooks()
     
-    # 6. TODO: Show the delta 
     
     
-    
-    return {
-        'specialization_score': float(specialization_score),  # Convert to Python float for safer serialization
-        'frequency_entropy': float(frequency_entropy),
-        'gini_coefficient': float(gini),
-        'mean_explained_variance': float(np.mean(neuron_frac_explained)),
+    res = {
+        'analysis/specialization_score': float(specialization_score),  # Convert to Python float for safer serialization
+        'analysis/frequency_entropy': float(frequency_entropy),
+        'analysis/gini_coefficient': float(gini),
+        'analysis/mean_explained_variance': float(np.mean(neuron_frac_explained)),
         # 'frequency_distribution': freq_dist,
         # 'average_frequency_strength': avg_freq_distribution,
         # 'neuron_freqs': neuron_freqs,
         # 'neuron_frac_explained': neuron_frac_explained,
-        'num_key_freqs': len(np.unique(neuron_freqs)),
+        'analysis/num_key_freqs': len(np.unique(neuron_freqs)),
         # 'frequency_strength_matrix': freq_strength_matrix,
-        'num_specialized_neurons': int(num_specialized_neurons),
-        'max_freq_strength': float(max_freq_strength)
+        'analysis/num_specialized_neurons': int(num_specialized_neurons),
+        'analysis/max_freq_strength': float(max_freq_strength),
+        'analysis/frequency_transitions': transition_metrics['freq_transitions'],
+        'analysis/strength_preservation': transition_metrics['strength_preservation'],
+        'analysis/active_frequencies': len(transition_metrics['active_freqs'])
+
     }
+    
+    # Add previous state tracking as attributes of the function
+    # TODO: This saves key frequency at epoch 10. I want to save key frequency at epoch 0.
+    if not hasattr(analyze_neuron_frequencies, 'prev_freqs'):
+        analyze_neuron_frequencies.prev_freqs = None
+        analyze_neuron_frequencies.prev_strengths = None
+    
+        # Update previous state for next call
+        analyze_neuron_frequencies.prev_freqs = neuron_freqs.copy()
+        analyze_neuron_frequencies.prev_strengths = neuron_frac_explained.copy()
+    
+    return res
+
     
 
 def plot_frequency_evolution(frequency_data_list, save_path=None):

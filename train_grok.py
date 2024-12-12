@@ -1,225 +1,276 @@
+import os
+import random
+from argparse import ArgumentParser
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Tuple
+
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+import wandb
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
-import wandb
-import os
-import random
-import numpy as np
-from transformers import AutoConfig, AutoModelForCausalLM
+
 from model import Transformer
-from argparse import ArgumentParser
+from utils import analyze_neuron_frequencies
 
-args = ArgumentParser()
-args.add_argument("--ckpt", type=str, default="")
-args.add_argument("--project_name", type=str, default="Arith-Transfer")
-args.add_argument("--fn_name", type=str, default="ADD", choices=["ADD", "ADD_SQUARE", "SQUARE_ADD"])
-args = args.parse_args()
+@dataclass
+class TrainingConfig:
+    d_vocab: int
+    seed: int
+    lr: float
+    weight_decay: float
+    frac_train: float
+    num_epochs: int
+    stopping_thresh: float
+    batch_size: int
+    num_layers: int
+    d_model: int
+    batch_style: str
+    n_ctx: int
+    d_mlp: int
+    num_heads: int
+    d_head: int
+    act_type: str
+    use_ln: bool
 
-# Set CUDA device
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
-
-# Function & WanDB Setting
-project_name = args.project_name
-fn_name = args.fn_name
-run_name =f"[Task: {fn_name}] from scratch"
-
-p = 113
-fns_dict = {'ADD': lambda x,y:(x+y) % p, 'ADD_SQUARE': lambda x,y:(x+y)**2 % p, 'SQUARE_ADD': lambda x,y:(x**2+y**2) % p}
-fn = fns_dict[fn_name]
-
-# Helper functions
-def cuda_memory():
-    print(torch.cuda.memory_allocated()/1e9)
-
-def cross_entropy_high_precision(logits, labels):
-    logprobs = F.log_softmax(logits.to(torch.float64), dim=-1)
-    prediction_logprobs = torch.gather(logprobs, index=labels[:, None], dim=-1)
-    loss = -torch.mean(prediction_logprobs)
-    return loss
-
-def full_loss_and_accuracy(model, data):
-    inputs = data[:, :-1]
-    labels = data[:, -1]
-    try:
-        logits = model(inputs)[:, -1]
-    except:
-        logits = model(inputs)['logits'][:, -1]
-    
-    loss = cross_entropy_high_precision(logits, labels)
-    
-    # Calculate accuracy
-    predictions = torch.argmax(logits, dim=-1)
-    accuracy = (predictions == labels).float().mean()
-    
-    return loss, accuracy
-
-def gen_train_test(frac_train, num, seed=0):
-    pairs = [(i, j, fn(i, j)) for i in range(num) for j in range(num)]
-    random.seed(seed)
-    random.shuffle(pairs)
-    div = int(frac_train*len(pairs))
-    return pairs[:div], pairs[div:]
-
-# WANDB Setting
-logging_dir = os.path.join(os.getcwd(), "log")
-os.makedirs(logging_dir, exist_ok=True)
-logging_dir = "/home/hyeonbin/reason/Self-Explore/wandb"
-
-wandb_id = wandb.util.generate_id()
-
-wandb.init(id=wandb_id, 
-           dir=logging_dir,
-           name=run_name,
-           project=project_name)
-
-# HyperParameters
-d_vocab = p + 1
-seed = 42
-lr = 1e-3
-weight_decay = 1
-frac_train = 0.3
-num_epochs = 30000
-stopping_thresh = 1e-9
-batch_size = 8192
-
-num_layers = 1
-d_model = 128 #@param
-batch_style = 'full'
-n_ctx = 3
-d_mlp = 4*d_model
-num_heads = 4
-assert d_model % num_heads == 0
-d_head = d_model//num_heads
-act_type = 'ReLU' #@param ['ReLU', 'GeLU']
-use_ln = False
-
-# Make a config
-config = {
-    "d_vocab": d_vocab,
-    "seed": seed,
-    "lr": lr,
-    "weight_decay": weight_decay,
-    "frac_train": frac_train,
-    "num_epochs": num_epochs,
-    "stopping_thresh": stopping_thresh,
-    "batch_size": batch_size,
-    "num_layers": num_layers,
-    "d_model": d_model,
-    "batch_style": batch_style,
-    "n_ctx": n_ctx,
-    "d_mlp": d_mlp,
-    "num_heads": num_heads,
-    "d_head": d_head,
-    "act_type": act_type,
-    "use_ln": use_ln
-}
-
-torch.manual_seed(seed)
-
-# Generate train and test data
-train_data, test_data = gen_train_test(frac_train, p, seed)
-
-# Convert to tensors
-train_tensor = torch.tensor(train_data, dtype=torch.long).to('cuda')
-test_tensor = torch.tensor(test_data, dtype=torch.long).to('cuda')
-
-
-# Create DataLoaders
-train_dataset = TensorDataset(train_tensor)
-test_dataset = TensorDataset(test_tensor)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size)
-
-# Load model
-model = Transformer(num_layers=num_layers, d_vocab=d_vocab, d_model=d_model, d_mlp=d_mlp, d_head=d_head, num_heads=num_heads, n_ctx=n_ctx, act_type=act_type, use_cache=False, use_ln=use_ln)
-model.to("cuda")
-
-if args.ckpt != "":
-    ckpt = torch.load(args.ckpt)["model"]
-    model.load_state_dict(ckpt)
-
-# Optimizer and scheduler
-optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.98))
-scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda step: min(step/10, 1))
-
-train_losses = []
-test_losses = []
-epochs = []
-state_dicts = []
-
-# Training loop
-for epoch in tqdm(range(num_epochs)):
-    model.train()
-    train_loss = 0.0
-    train_acc = 0.0
-    for batch in train_loader:
-        batch = batch[0].to('cuda')
-        loss, acc = full_loss_and_accuracy(model, batch)
-        train_loss += loss.item()
-        train_acc += acc.item()
+class ArithmeticTrainer:
+    def __init__(self, config: TrainingConfig, modulo: int, function_name: str):
+        self.config = config
+        self.modulo = modulo
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    
-    train_loss /= len(train_loader)
-    train_acc /= len(train_loader)
-    
-    model.eval()
-    test_loss = 0.0
-    test_acc = 0.0
-    with torch.no_grad():
-        for batch in test_loader:
-            batch = batch[0].to('cuda')
-            loss, acc = full_loss_and_accuracy(model, batch)
-            test_loss += loss.item()
-            test_acc += acc.item()
-    
-    test_loss /= len(test_loader)
-    test_acc /= len(test_loader)
-    
-    scheduler.step()
+        # Initialize functions dictionary
+        self.fns_dict = {
+            'Task1': lambda x, y: (x + y) % modulo,                        # Original - Addition
+            'Task2': lambda x, y: (x - y) % modulo,                        # New - Subtraction
+            'Task3': lambda x, y: (x + y)**2 % modulo,                     # Original - Add then Square
+            'Task4': lambda x, y: (x**2 + y**2) % modulo,                  # Original - Square then Add
+            'Task5': lambda x, y: (x * pow(y, modulo-2, modulo)) % modulo, # New - Division
+            'Task6': lambda x, y: (2*x*y) % modulo,           # New - Quadratic with cross term
+            'Task7': lambda x, y: (x**3 + y**3) % modulo,          # New - Cubic with quadratic term
+            'Task8': lambda x, y: (x + y)** 3 % modulo,
+            'Task9': lambda x, y: (x*y) % modulo
+        }
+        self.fn = self.fns_dict[function_name]
+        
+        # Initialize model
+        self.model = self._initialize_model()
+        self.optimizer = self._initialize_optimizer()
+        self.scheduler = optim.lr_scheduler.LambdaLR(
+            self.optimizer, 
+            lambda step: min(step/10, 1)
+        )
 
-    # wandb log
-    wandb.log({
-        'train_loss': train_loss,
-        'test_loss': test_loss,
-        'train_accuracy': train_acc,
-        'test_accuracy': test_acc,
-        'lr': scheduler.get_last_lr()[0]
-    }, step=epoch)
+    def _initialize_model(self) -> Transformer:
+        model = Transformer(
+            num_layers=self.config.num_layers,
+            d_vocab=self.config.d_vocab,
+            d_model=self.config.d_model,
+            d_mlp=self.config.d_mlp,
+            d_head=self.config.d_head,
+            num_heads=self.config.num_heads,
+            n_ctx=self.config.n_ctx,
+            act_type=self.config.act_type,
+            use_cache=False,
+            use_ln=self.config.use_ln
+        )
+        return model.to(self.device)
 
-    # Saving state dict every 100 epochs.
-    if epoch % 100 == 0:
-        train_losses.append(train_loss)
-        test_losses.append(test_loss)
-        epochs.append(epoch)
-        state_dicts.append(model.state_dict()) # Is it okay like this? wouldn't it consume GPU?
+    def _initialize_optimizer(self) -> optim.AdamW:
+        return optim.AdamW(
+            self.model.parameters(),
+            lr=self.config.lr,
+            weight_decay=self.config.weight_decay,
+            betas=(0.9, 0.98)
+        )
+
+    @staticmethod
+    def cross_entropy_high_precision(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        logprobs = F.log_softmax(logits.to(torch.float64), dim=-1)
+        prediction_logprobs = torch.gather(logprobs, index=labels[:, None], dim=-1)
+        return -torch.mean(prediction_logprobs)
+
+    def compute_loss_and_accuracy(self, data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        inputs = data[:, :-1]
+        labels = data[:, -1]
+        
+        try:
+            logits = self.model(inputs)[:, -1]
+        except:
+            logits = self.model(inputs)['logits'][:, -1]
+        
+        loss = self.cross_entropy_high_precision(logits, labels)
+        predictions = torch.argmax(logits, dim=-1)
+        accuracy = (predictions == labels).float().mean()
+        
+        return loss, accuracy
+
+    def generate_dataset(self) -> Tuple[DataLoader, DataLoader]:
+        def gen_pairs(frac_train: float, num: int, seed: int = 0) -> Tuple[List, List]:
+            pairs = [(i, j, self.fn(i, j)) for i in range(num) for j in range(num)]
+            random.seed(seed)
+            random.shuffle(pairs)
+            div = int(frac_train * len(pairs))
+            return pairs[:div], pairs[div:]
+
+        train_data, test_data = gen_pairs(self.config.frac_train, self.modulo, self.config.seed)
+        
+        train_tensor = torch.tensor(train_data, dtype=torch.long).to(self.device)
+        test_tensor = torch.tensor(test_data, dtype=torch.long).to(self.device)
+        
+        train_dataset = TensorDataset(train_tensor)
+        test_dataset = TensorDataset(test_tensor)
+        
+        train_loader = DataLoader(train_dataset, batch_size=self.config.batch_size, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=self.config.batch_size)
+        
+        return train_loader, test_loader
+
+    def train_epoch(self, train_loader: DataLoader) -> Tuple[float, float]:
+        self.model.train()
+        total_loss = 0.0
+        total_acc = 0.0
+        
+        for batch in train_loader:
+            batch = batch[0].to(self.device)
+            loss, acc = self.compute_loss_and_accuracy(batch)
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            total_acc += acc.item()
+        
+        return total_loss / len(train_loader), total_acc / len(train_loader)
+
+    def evaluate(self, test_loader: DataLoader) -> Tuple[float, float]:
+        self.model.eval()
+        total_loss = 0.0
+        total_acc = 0.0
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                batch = batch[0].to(self.device)
+                loss, acc = self.compute_loss_and_accuracy(batch)
+                total_loss += loss.item()
+                total_acc += acc.item()
+        
+        return total_loss / len(test_loader), total_acc / len(test_loader)
+
+    def save_checkpoint(self, save_dir: str, run_name: str, 
+                       train_losses: List[float], test_losses: List[float], 
+                       epochs: List[int], state_dicts: List[Dict]) -> None:
+        final_dict = {
+            'train_losses': train_losses,
+            'test_losses': test_losses,
+            'epochs': epochs,
+            'state_dicts': state_dicts,
+            'model': self.model.state_dict(),
+            'config': self.config.__dict__
+        }
+        
+        save_path = os.path.join(save_dir, run_name, "full_run_data.pth")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save(final_dict, save_path)
+
+    def train(self, run_name: str, project_name: str) -> None:
+        # Initialize wandb
+        wandb.init(
+            id=wandb.util.generate_id(),
+            dir=os.path.join(os.getcwd(), "log"),
+            name=run_name,
+            project=project_name
+        )
+
+        train_loader, test_loader = self.generate_dataset()
+        train_losses, test_losses = [], []
+        epochs_list, state_dicts = [], []
+
+        for epoch in tqdm(range(self.config.num_epochs)):
+            train_loss, train_acc = self.train_epoch(train_loader)
+            test_loss, test_acc = self.evaluate(test_loader)
+            
+            self.scheduler.step()
+
+            # Log metrics
+            wandb.log({
+                'train_loss': train_loss,
+                'test_loss': test_loss,
+                'train_accuracy': train_acc,
+                'test_accuracy': test_acc,
+                'lr': self.scheduler.get_last_lr()[0]
+            }, step=epoch)
+
+            # Save checkpoints
+            if epoch % 10 == 0 and epoch != 0:
+                train_losses.append(train_loss)
+                test_losses.append(test_loss)
+                epochs_list.append(epoch)
+                state_dicts.append(self.model.state_dict())
+                
+                res = analyze_neuron_frequencies(self.model, device=self.device)
+                wandb.log(res, step=epoch)
+
+            # Early stopping
+            if test_loss < self.config.stopping_thresh:
+                print(f"Early stopping at epoch {epoch}")
+                print(f"Final train accuracy: {train_acc:.4f}")
+                print(f"Final test accuracy: {test_acc:.4f}")
+                break
+
+        # Save final results
+        self.save_checkpoint(
+            os.getcwd(),
+            run_name,
+            train_losses,
+            test_losses,
+            epochs_list,
+            state_dicts
+        )
+
+def main():
+    parser = ArgumentParser()
+    parser.add_argument("--ckpt", type=str, default="")
+    parser.add_argument("--project_name", type=str, default="Arith-Transfer-Again")
+    parser.add_argument("--fn_name", type=str, default="Task1", 
+                       choices=["Task1", "Task2", "Task3", "Task4", "Task5", "Task6", "Task7", "Task8", "Task9"])
+    args = parser.parse_args()
+
+    # Configuration
+    config = TrainingConfig(
+        d_vocab=114,  # p + 1
+        seed=42,
+        lr=1e-3,
+        weight_decay=1,
+        frac_train=0.3,
+        num_epochs=50000,
+        stopping_thresh=1e-9,
+        batch_size=16384,
+        num_layers=1,
+        d_model=128,
+        batch_style='full',
+        n_ctx=3,
+        d_mlp=512,  # 4*d_model
+        num_heads=4,
+        d_head=32,  # d_model//num_heads
+        act_type='ReLU',
+        use_ln=False
+    )
+
+    # Initialize trainer
+    trainer = ArithmeticTrainer(config, modulo=113, function_name=args.fn_name)
     
-    # Stop Criteria.
-    if test_loss < stopping_thresh:
-        print(f"Early stopping at epoch {epoch}")
-        print(f"Final train accuracy: {train_acc:.4f}")
-        print(f"Final test accuracy: {test_acc:.4f}")
-        break
-    
+    # Load checkpoint if provided
+    if args.ckpt:
+        ckpt = torch.load(args.ckpt)["model"]
+        trainer.model.load_state_dict(ckpt)
+        run_name = f"{args.ckpt.split('/')[-2]}->{args.fn_name}"
+    else:
+        run_name = args.fn_name
+            
+    trainer.train(run_name, args.project_name)
 
-# Gather all and save.
-final_dict = {
-    'train_losses': train_losses,
-    'test_losses': test_losses,
-    'epochs': epochs,
-    'state_dicts': state_dicts,
-    'model': model.state_dict(),
-    'config': config
-}
-
-save_dir = os.getcwd() + "/" + run_name
-os.makedirs(save_dir, exist_ok=True)
-torch.save(final_dict, save_dir + "/full_run_data.pth")
-
-print("Training completed")
-print(f"Final train accuracy: {train_acc:.4f}")
-print(f"Final test accuracy: {test_acc:.4f}")
+if __name__ == "__main__":
+    main()
