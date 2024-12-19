@@ -1,4 +1,4 @@
-# Arith_transfer
+# 🐸 Grok-Grok 🐸
 
 This repository contains the implementation for our paper "Grokking After Grokking: Case study of Task Transfer in Modular Arithmetics" investigating how neural networks transfer learned computational patterns between modular arithmetic tasks.
 
