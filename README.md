@@ -2,7 +2,7 @@
 
 This repository contains the implementation for our paper "**Grokking After Grokking: Case study of Task Transfer in Modular Arithmetics**" investigating how 1-Layer Transformer transfer learned computational patterns between modular arithmetic tasks.
 
-[[Paper Link]](https://drive.google.com/file/d/1_DSXhYo8Mf-VbKW3d0_EiWaYE07BWT_X/view?usp=sharing)
+[[Paper Link]](https://drive.google.com/file/d/1uEkgY8TCqd-CIFnySd4QhVOVNcg-HEwm/view?usp=sharing)
 
 ## Overview
 
