@@ -169,17 +169,36 @@ class TransformerBlock(nn.Module):
         x = self.hook_resid_post(x + self.hook_mlp_out(self.mlp((x))))
         return x
 
-# Full transformer
+class DeepEmbed(nn.Module):
+    def __init__(self, d_vocab, d_model, num_layers=2):
+        super().__init__()
+        self.token_embed = nn.Embedding(d_vocab, d_model)
+        
+        # Create stack of linear layers
+        self.layers = nn.ModuleList()
+        for i in range(num_layers - 1):
+            self.layers.append(nn.Linear(d_model, d_model))
+            
+    def forward(self, x):
+        x = self.token_embed(x)
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
 class Transformer(nn.Module):
-    def __init__(self, num_layers, d_vocab, d_model, d_mlp, d_head, num_heads, n_ctx, act_type, use_cache=False, use_ln=True):
+    def __init__(self, num_layers, d_vocab, d_model, d_mlp, d_head, num_heads, n_ctx, 
+                 act_type, embed_layers=2, use_cache=False, use_ln=True):
         super().__init__()
         self.cache = {}
         self.use_cache = use_cache
 
-        self.embed = Embed(d_vocab, d_model)
+        # Replace simple embedding with deep embedding
+        self.embed = DeepEmbed(d_vocab, d_model, num_layers=embed_layers)
         self.pos_embed = PosEmbed(n_ctx, d_model)
-        self.blocks = nn.ModuleList([TransformerBlock(d_model, d_mlp, d_head, num_heads, n_ctx, act_type, model=[self]) for i in range(num_layers)])
-        # self.ln = LayerNorm(d_model, model=[self])
+        self.blocks = nn.ModuleList([
+            TransformerBlock(d_model, d_mlp, d_head, num_heads, n_ctx, act_type, model=[self]) 
+            for i in range(num_layers)
+        ])
         self.unembed = Unembed(d_vocab, d_model)
         self.use_ln = use_ln
 
@@ -192,7 +211,6 @@ class Transformer(nn.Module):
         x = self.pos_embed(x)
         for block in self.blocks:
             x = block(x)
-        # x = self.ln(x)
         x = self.unembed(x)
         return x
 
