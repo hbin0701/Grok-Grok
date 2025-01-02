@@ -10,6 +10,7 @@ import torch.optim as optim
 import wandb
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
+from pathlib import Path
 
 from model import Transformer
 from utils import analyze_neuron_frequencies
@@ -176,10 +177,10 @@ class ArithmeticTrainer:
         torch.save(final_dict, save_path)
 
     def train(self, run_name: str, project_name: str) -> None:
+                
         # Initialize wandb
         wandb.init(
             id=wandb.util.generate_id(),
-            dir=os.path.join(os.getcwd(), "log"),
             name=run_name,
             project=project_name
         )
@@ -220,9 +221,12 @@ class ArithmeticTrainer:
                 print(f"Final test accuracy: {test_acc:.4f}")
                 break
 
+        ckpt_dir = Path(__file__).parent / "ckpts"
+        ckpt_dir.mkdir(exist_ok=True, parents=True)
+
         # Save final results
         self.save_checkpoint(
-            os.getcwd(),
+            ckpt_dir,
             run_name,
             train_losses,
             test_losses,
