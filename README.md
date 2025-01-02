@@ -4,6 +4,13 @@ This repository contains the implementation for our paper "**Grokking After Grok
 
 [[Paper Link]](https://drive.google.com/file/d/1uEkgY8TCqd-CIFnySd4QhVOVNcg-HEwm/view?usp=sharing)
 
+## Installation
+
+```bash
+pip install torch numpy wandb tqdm einops scipy
+```
+
+
 ## Overview
 
 We study task transfer across 9 modular arithmetic tasks:
